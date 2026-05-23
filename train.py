@@ -1,5 +1,6 @@
 # %%
 import os
+import numpy as np
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from tqdm import tqdm
 
@@ -48,22 +49,76 @@ def test(model, device, test_loader, loss_function_seg, loss_function_cls):
     test_loss_cls = 0
     n_test = len(test_loader.dataset)  # total number of test data
 
-    for data, seg_target, cls_target in test_loader:
-        data, seg_target, cls_target = data.to(device), seg_target.to(device), cls_target.to(device)
-        seg_output, cls_output = model(data)
+    with torch.no_grad():
+        for data, seg_target, cls_target in test_loader:
+            data, seg_target, cls_target = data.to(device), seg_target.to(device), cls_target.to(device)
+            seg_output, cls_output = model(data)
 
-        loss_seg = loss_function_seg(seg_output, torch.argmax(seg_target, dim=1))
-        loss_cls = loss_function_cls(cls_output, cls_target)
-        loss = loss_seg + loss_cls
+            loss_seg = loss_function_seg(seg_output, torch.argmax(seg_target, dim=1))
+            loss_cls = loss_function_cls(cls_output, cls_target)
+            loss = loss_seg + loss_cls
 
-        test_loss += loss.item() * len(data)
-        test_loss_seg += loss_seg.item() * len(data)
-        test_loss_cls += loss_cls.item() * len(data)
+            test_loss += loss.item() * len(data)
+            test_loss_seg += loss_seg.item() * len(data)
+            test_loss_cls += loss_cls.item() * len(data)
 
     test_loss = test_loss / n_test
     test_loss_seg = test_loss_seg / n_test
     test_loss_cls = test_loss_cls / n_test
     return test_loss, test_loss_seg, test_loss_cls
+
+
+def predict_and_save(model, device, test_loader, X_test, y_seg_test, y_cls_test, save_path='predictions.npz'):
+    """Chạy dự đoán trên tập test, in metrics và lưu kết quả."""
+    model.eval()
+    all_seg_pred = []
+    all_cls_pred = []
+
+    with torch.no_grad():
+        for data, seg_target, cls_target in test_loader:
+            data = data.to(device)
+            seg_output, cls_output = model(data)
+            seg_pred = torch.argmax(seg_output, dim=1).cpu().numpy()
+            cls_pred = torch.argmax(cls_output, dim=1).cpu().numpy()
+            all_seg_pred.append(seg_pred)
+            all_cls_pred.append(cls_pred)
+
+    all_seg_pred = np.concatenate(all_seg_pred, axis=0)
+    all_cls_pred = np.concatenate(all_cls_pred, axis=0)
+
+    # Ground truth
+    seg_true = torch.argmax(y_seg_test, dim=1).numpy()
+    cls_true = y_cls_test.numpy()
+    signals = X_test.squeeze(1).numpy()
+
+    # Save predictions
+    np.savez(save_path,
+             seg_pred=all_seg_pred,
+             seg_true=seg_true,
+             cls_pred=all_cls_pred,
+             cls_true=cls_true,
+             signals=signals)
+
+    # Print metrics
+    cls_acc = np.mean(all_cls_pred == cls_true)
+    seg_acc = np.mean(all_seg_pred == seg_true)
+
+    class_names = ['P', 'QRS', 'T', 'Baseline']
+    print(f'\n{"="*50}')
+    print(f'TEST RESULTS')
+    print(f'{"="*50}')
+    print(f'Classification Accuracy: {cls_acc:.4f}')
+    print(f'Segmentation Pixel Accuracy: {seg_acc:.4f}')
+    for c in range(4):
+        p_c = (all_seg_pred == c)
+        t_c = (seg_true == c)
+        intersection = np.sum(p_c & t_c)
+        union = np.sum(p_c) + np.sum(t_c)
+        dice = 2.0 * intersection / union if union > 0 else 1.0
+        print(f'Dice Score ({class_names[c]:>8s}): {dice:.4f}')
+
+    print(f'{"="*50}')
+    print(f'Predictions saved to: {save_path}')
 
 
 def train_model(
@@ -79,7 +134,7 @@ def train_model(
 ):
     
     # train/test split for ludb
-    n_ludb_train = 100
+    n_ludb_train = 160 #100
     ludb_files = [os.path.abspath(os.path.join(data_dir, p))[:-4] for p in os.listdir(data_dir) if p.endswith('.hea')]
     ludb_files_train = ludb_files[:n_ludb_train]
     ludb_files_test = ludb_files[n_ludb_train:]
@@ -120,6 +175,7 @@ def train_model(
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     # train
+    best_loss = float('inf')
     for epoch in range(1, epochs + 1):
         train_loss, train_loss_seg, train_loss_cls = train(model, device, train_loader, loss_function_seg, 
                                                            loss_function_cls, optimizer, alpha=alpha,
@@ -132,5 +188,30 @@ def train_model(
             \ttest_loss: {test_loss:.4f}, test_loss_seg : {test_loss_seg:.4f}, test_loss_cls : {test_loss_cls:.4f},
         ''')
 
+        # Save best model
+        if test_loss < best_loss:
+            best_loss = test_loss
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'epoch': epoch,
+                'test_loss': test_loss,
+                'n_channels': n_channels,
+            }, 'best_model.pth')
+            print(f'    --> Saved best model (test_loss: {best_loss:.4f})')
+
         if scheduler is not None:
             scheduler.step()
+
+    # Save final model
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epochs,
+        'n_channels': n_channels,
+    }, 'final_model.pth')
+    print('\n--> Saved final model: final_model.pth')
+
+    # Run prediction on test set and save results
+    print('\nRunning prediction on test set...')
+    predict_and_save(model, device, test_loader, X_test, y_seg_test, y_cls_test, 'predictions.npz')
