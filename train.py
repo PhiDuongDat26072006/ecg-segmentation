@@ -134,7 +134,7 @@ def train_model(
 ):
     
     # train/test split for ludb
-    n_ludb_train = 160 #100
+    n_ludb_train = 180 # 180/200
     ludb_files = [os.path.abspath(os.path.join(data_dir, p))[:-4] for p in os.listdir(data_dir) if p.endswith('.hea')]
     ludb_files_train = ludb_files[:n_ludb_train]
     ludb_files_test = ludb_files[n_ludb_train:]
@@ -148,7 +148,7 @@ def train_model(
     loss_function_seg = FocalLoss(gamma=focal_gamma)
     loss_function_cls = torch.nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, verbose=True, eta_min=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
 
     # define sampler
     if sampler:
