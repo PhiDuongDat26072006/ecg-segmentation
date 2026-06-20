@@ -133,85 +133,90 @@ def train_model(
     sampler=False, 
 ):
     
-    # train/test split for ludb
-    n_ludb_train = 180 # 180/200
-    ludb_files = [os.path.abspath(os.path.join(data_dir, p))[:-4] for p in os.listdir(data_dir) if p.endswith('.hea')]
-    ludb_files_train = ludb_files[:n_ludb_train]
-    ludb_files_test = ludb_files[n_ludb_train:]
+    n_ludb_test = 66
+    ludb_files = [os.path.abspath(os.path.join(data_dir, p))[:-4] for p in sorted(os.listdir(data_dir)) if p.endswith('.hea')]
 
-    X_train, y_seg_train, y_cls_train = load_ludb_tensors(ludb_files_train)
-    X_test, y_seg_test, y_cls_test = load_ludb_tensors(ludb_files_test)
+    for fold_idx in range(3):
+        print(f"\n{'='*20} TRAINING FOLD {fold_idx} {'='*20}")
+        test_start_idx = 1 + fold_idx * n_ludb_test
+        test_end_idx = 1 + (fold_idx + 1) * n_ludb_test
+        ludb_files_test = ludb_files[test_start_idx:test_end_idx]
+        ludb_files_train = ludb_files[:test_start_idx] + ludb_files[test_end_idx:]
 
-    # prepare training
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model = ECGUNet3pCGM(n_channels=n_channels).to(device)
-    loss_function_seg = FocalLoss(gamma=focal_gamma)
-    loss_function_cls = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
+        X_train, y_seg_train, y_cls_train = load_ludb_tensors(ludb_files_train)
+        X_test, y_seg_test, y_cls_test = load_ludb_tensors(ludb_files_test)
 
-    # define sampler
-    if sampler:
-        target = y_cls_train
-        weight = torch.tensor([1. / torch.sum(target == t) for t in torch.unique(target)])
-        samples_weight = torch.tensor([weight[int(t)] for t in target]).double()
-        sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
-        shuffle = None
-    else:
-        sampler = None
-        shuffle = True
+        # prepare training
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        model = ECGUNet3pCGM(n_channels=n_channels).to(device)
+        loss_function_seg = FocalLoss(gamma=focal_gamma)
+        loss_function_cls = torch.nn.CrossEntropyLoss()
+        optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100, eta_min=1e-5)
 
-    # create dataloader
-    train_dataset = CustomTensorDataset(tensors=(X_train, y_seg_train, y_cls_train), transform=Compose([
-        RandomCrop(2000, start=1000, end=4000),
-        BaselineWander(prob=0.2),
-        GaussianNoise(prob=0.2),
-        PowerlineNoise(prob=0.2),
-        ChannelResize(),
-        BaselineShift(prob=0.2),
-    ]))
-    test_dataset = CustomTensorDataset(tensors=(X_test, y_seg_test, y_cls_test))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, sampler=sampler)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+        # define sampler
+        if sampler:
+            target = y_cls_train
+            weight = torch.tensor([1. / torch.sum(target == t) for t in torch.unique(target)])
+            samples_weight = torch.tensor([weight[int(t)] for t in target]).double()
+            train_sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
+            shuffle = None
+        else:
+            train_sampler = None
+            shuffle = True
 
-    # train
-    best_loss = float('inf')
-    for epoch in range(1, epochs + 1):
-        train_loss, train_loss_seg, train_loss_cls = train(model, device, train_loader, loss_function_seg, 
-                                                           loss_function_cls, optimizer, alpha=alpha,
-                                                           beta=beta)
-        test_loss, test_loss_seg, test_loss_cls = test(model, device, test_loader, loss_function_seg,
-                                                       loss_function_cls)
+        # create dataloader
+        train_dataset = CustomTensorDataset(tensors=(X_train, y_seg_train, y_cls_train), transform=Compose([
+            RandomCrop(2000, start=1000, end=4000),
+            BaselineWander(prob=0.2),
+            GaussianNoise(prob=0.2),
+            PowerlineNoise(prob=0.2),
+            ChannelResize(),
+            BaselineShift(prob=0.2),
+        ]))
+        test_dataset = CustomTensorDataset(tensors=(X_test, y_seg_test, y_cls_test))
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=shuffle, sampler=train_sampler)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-        print(f'''epoch: {epoch}/{epochs}:
-            \ttrain_loss: {train_loss:.4f}, train_loss_seg: {train_loss_seg:.4f}, train_loss_cls: {train_loss_cls:.4f}, 
-            \ttest_loss: {test_loss:.4f}, test_loss_seg : {test_loss_seg:.4f}, test_loss_cls : {test_loss_cls:.4f},
-        ''')
+        # train
+        best_loss = float('inf')
+        for epoch in range(1, epochs + 1):
+            train_loss, train_loss_seg, train_loss_cls = train(model, device, train_loader, loss_function_seg, 
+                                                               loss_function_cls, optimizer, alpha=alpha,
+                                                               beta=beta)
+            test_loss, test_loss_seg, test_loss_cls = test(model, device, test_loader, loss_function_seg,
+                                                           loss_function_cls)
 
-        # Save best model
-        if test_loss < best_loss:
-            best_loss = test_loss
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'epoch': epoch,
-                'test_loss': test_loss,
-                'n_channels': n_channels,
-            }, 'best_model.pth')
-            print(f'    --> Saved best model (test_loss: {best_loss:.4f})')
+            print(f'''fold: {fold_idx}, epoch: {epoch}/{epochs}:
+                \ttrain_loss: {train_loss:.4f}, train_loss_seg: {train_loss_seg:.4f}, train_loss_cls: {train_loss_cls:.4f}, 
+                \ttest_loss: {test_loss:.4f}, test_loss_seg : {test_loss_seg:.4f}, test_loss_cls : {test_loss_cls:.4f},
+            ''')
 
-        if scheduler is not None:
-            scheduler.step()
+            # Save best model
+            if test_loss < best_loss:
+                best_loss = test_loss
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'epoch': epoch,
+                    'test_loss': test_loss,
+                    'n_channels': n_channels,
+                }, f'best_model_fold{fold_idx}.pth')
+                print(f'    --> Saved best model for fold {fold_idx} (test_loss: {best_loss:.4f})')
 
-    # Save final model
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'epoch': epochs,
-        'n_channels': n_channels,
-    }, 'final_model.pth')
-    print('\n--> Saved final model: final_model.pth')
+            if scheduler is not None:
+                scheduler.step()
 
-    # Run prediction on test set and save results
-    print('\nRunning prediction on test set...')
-    predict_and_save(model, device, test_loader, X_test, y_seg_test, y_cls_test, 'predictions.npz')
+        # Save final model
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'epoch': epochs,
+            'n_channels': n_channels,
+        }, f'fold{fold_idx}.pth')
+        print(f'\n--> Saved final model: fold{fold_idx}.pth')
+
+        # Run prediction on test set and save results
+        print(f'\nRunning prediction on test set for fold {fold_idx}...')
+        predict_and_save(model, device, test_loader, X_test, y_seg_test, y_cls_test, f'predictions_fold{fold_idx}.npz')
+
