@@ -7,7 +7,7 @@ from tqdm import tqdm
 from datareader import load_ludb_tensors
 from loss import FocalLoss
 from transform import *
-from model import ECGUNet3pCGM
+from model import ECGUNet3p
 
 
 def train(model, device, train_loader, loss_function_seg, loss_function_cls, optimizer, alpha=1.0, beta=1.0):
@@ -20,13 +20,25 @@ def train(model, device, train_loader, loss_function_seg, loss_function_cls, opt
     for data, seg_target, cls_target in tqdm(train_loader):
         # pass through model
         data, seg_target, cls_target = data.to(device), seg_target.to(device), cls_target.to(device)
-        seg_output, cls_output = model(data)
+        output = model(data)
+        
+        if isinstance(output, tuple):
+            seg_output, cls_output = output
+            loss_cls = loss_function_cls(cls_output, cls_target)
+        else:
+            seg_output = output
+            cls_output = torch.zeros((data.shape[0], 2), device=device)
+            loss_cls = torch.tensor(0.0, device=device)
 
         # loss calculation and backprop
         optimizer.zero_grad()
         loss_seg = loss_function_seg(seg_output, torch.argmax(seg_target, dim=1))
-        loss_cls = loss_function_cls(cls_output, cls_target)
-        loss = alpha * loss_seg + beta * loss_cls
+        
+        if not isinstance(output, tuple):
+            loss = loss_seg
+        else:
+            loss = alpha * loss_seg + beta * loss_cls
+            
         loss.backward()
         optimizer.step()
 
@@ -52,11 +64,22 @@ def test(model, device, test_loader, loss_function_seg, loss_function_cls):
     with torch.no_grad():
         for data, seg_target, cls_target in test_loader:
             data, seg_target, cls_target = data.to(device), seg_target.to(device), cls_target.to(device)
-            seg_output, cls_output = model(data)
+            output = model(data)
+            
+            if isinstance(output, tuple):
+                seg_output, cls_output = output
+                loss_cls = loss_function_cls(cls_output, cls_target)
+            else:
+                seg_output = output
+                cls_output = torch.zeros((data.shape[0], 2), device=device)
+                loss_cls = torch.tensor(0.0, device=device)
 
             loss_seg = loss_function_seg(seg_output, torch.argmax(seg_target, dim=1))
-            loss_cls = loss_function_cls(cls_output, cls_target)
-            loss = loss_seg + loss_cls
+            
+            if not isinstance(output, tuple):
+                loss = loss_seg
+            else:
+                loss = loss_seg + loss_cls
 
             test_loss += loss.item() * len(data)
             test_loss_seg += loss_seg.item() * len(data)
@@ -77,7 +100,13 @@ def predict_and_save(model, device, test_loader, X_test, y_seg_test, y_cls_test,
     with torch.no_grad():
         for data, seg_target, cls_target in test_loader:
             data = data.to(device)
-            seg_output, cls_output = model(data)
+            output = model(data)
+            if isinstance(output, tuple):
+                seg_output, cls_output = output
+            else:
+                seg_output = output
+                cls_output = torch.zeros((data.shape[0], 2), device=device)
+                
             seg_pred = torch.argmax(seg_output, dim=1).cpu().numpy()
             cls_pred = torch.argmax(cls_output, dim=1).cpu().numpy()
             all_seg_pred.append(seg_pred)
@@ -148,7 +177,7 @@ def train_model(
 
         # prepare training
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        model = ECGUNet3pCGM(n_channels=n_channels).to(device)
+        model = ECGUNet3p(n_channels=n_channels).to(device)
         loss_function_seg = FocalLoss(gamma=focal_gamma)
         loss_function_cls = torch.nn.CrossEntropyLoss()
         optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
